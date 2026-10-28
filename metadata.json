@@ -1,0 +1,6 @@
+{
+  "name": "Aura Music",
+  "description": "Modern offline music player with custom background videos, smart folder filtering, cover art resolution, and gapless queue management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
