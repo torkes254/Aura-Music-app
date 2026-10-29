@@ -21,6 +21,13 @@ import com.example.MainActivity
 import com.example.data.cover.CoverArtResolver
 import com.example.model.Song
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class PlaybackService : MediaSessionService() {
 
@@ -29,6 +36,11 @@ class PlaybackService : MediaSessionService() {
         private set
     lateinit var queueManager: ShuffleQueueManager
         private set
+
+    private val serviceScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private var currentQueueSongIds: List<Long> = emptyList()
+    private var lastSkipTimestampMs: Long = 0L
+    private var updateQueueJob: Job? = null
 
     companion object {
         const val CHANNEL_ID = "aura_music_playback_channel"
@@ -77,13 +89,7 @@ class PlaybackService : MediaSessionService() {
         val fullQueue = queueManager.getFullOrderedQueue()
         val currentSong = queueManager.getCurrentSong()
         if (fullQueue.isNotEmpty() && currentSong != null) {
-            val mediaItems = MediaItemHelper.toMediaItems(this, fullQueue)
-            val currentIndex = queueManager.getCurrentQueueIndex().coerceIn(0, mediaItems.size - 1)
-            val pos = queueManager.getCurrentPositionMs()
-            val artPath = CoverArtResolver.getInstance(this).getArtwork(currentSong)
-            queueManager.updateArtwork(artPath)
-            player.setMediaItems(mediaItems, currentIndex, pos)
-            player.prepare()
+            updatePlayerQueue(startPlay = false, positionMs = queueManager.getCurrentPositionMs())
         }
 
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -123,19 +129,50 @@ class PlaybackService : MediaSessionService() {
         val fullQueue = queueManager.getFullOrderedQueue()
         val currentSong = queueManager.getCurrentSong() ?: fullQueue.firstOrNull()
         if (fullQueue.isEmpty() || currentSong == null) {
+            currentQueueSongIds = emptyList()
             player.clearMediaItems()
             return
         }
 
-        val mediaItems = MediaItemHelper.toMediaItems(this, fullQueue)
-        val currentIndex = queueManager.getCurrentQueueIndex().coerceIn(0, mediaItems.size - 1)
-        val artPath = CoverArtResolver.getInstance(this).getArtwork(currentSong)
-        queueManager.updateArtwork(artPath)
+        val newSongIds = fullQueue.map { it.id }
+        val newIndex = queueManager.getCurrentQueueIndex().coerceIn(0, fullQueue.size - 1)
 
-        player.setMediaItems(mediaItems, currentIndex, positionMs)
-        player.prepare()
-        if (startPlay) {
-            player.play()
+        // Requirement 5: Don't rebuild the whole queue on every skip.
+        // If the player already holds the correct queue, use player.seekTo(newIndex, 0).
+        // Rebuild only when the queue contents or order actually changed.
+        if (currentQueueSongIds == newSongIds && player.mediaItemCount == fullQueue.size) {
+            player.seekTo(newIndex, positionMs)
+            if (startPlay) {
+                player.play()
+            }
+            // Requirement 1: Only the current song may resolve artwork fully
+            serviceScope.launch(Dispatchers.IO) {
+                val artPath = CoverArtResolver.getInstance(this@PlaybackService).getArtwork(currentSong)
+                queueManager.updateArtwork(artPath)
+            }
+            return
+        }
+
+        // Rebuild queue because contents or order changed
+        updateQueueJob?.cancel()
+        updateQueueJob = serviceScope.launch {
+            // Requirement 4: Build MediaItems on Dispatchers.Default and call player.setMediaItems on the main thread
+            val mediaItems = withContext(Dispatchers.Default) {
+                MediaItemHelper.toMediaItems(this@PlaybackService, fullQueue)
+            }
+            currentQueueSongIds = newSongIds
+
+            player.setMediaItems(mediaItems, newIndex, positionMs)
+            player.prepare()
+            if (startPlay) {
+                player.play()
+            }
+
+            // Only the current song may resolve artwork fully
+            val artPath = withContext(Dispatchers.IO) {
+                CoverArtResolver.getInstance(this@PlaybackService).getArtwork(currentSong)
+            }
+            queueManager.updateArtwork(artPath)
         }
     }
 
@@ -146,6 +183,13 @@ class PlaybackService : MediaSessionService() {
     }
 
     fun skipToNext() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // Requirement 7: ignore a repeated skip within 400 ms
+        if (now - lastSkipTimestampMs < 400L) {
+            return
+        }
+        lastSkipTimestampMs = now
+
         val nextSong = queueManager.nextTrack(isManualSkip = true)
         if (nextSong != null) {
             com.example.data.local.PlayCountManager.getInstance(this).incrementPlayCount(nextSong.id)
@@ -156,6 +200,13 @@ class PlaybackService : MediaSessionService() {
     }
 
     fun skipToPrevious() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // Requirement 7: ignore a repeated skip within 400 ms
+        if (now - lastSkipTimestampMs < 400L) {
+            return
+        }
+        lastSkipTimestampMs = now
+
         val currentPos = player.currentPosition
         if (currentPos > 3000L) {
             player.seekTo(0L)
@@ -179,6 +230,8 @@ class PlaybackService : MediaSessionService() {
         if (currentService == this) {
             currentService = null
         }
+        updateQueueJob?.cancel()
+        serviceScope.cancel()
         mediaSession?.run {
             player.release()
             release()
@@ -202,18 +255,6 @@ class PlaybackService : MediaSessionService() {
             }
             if (keyEvent != null && keyEvent.action == KeyEvent.ACTION_DOWN) {
                 when (keyEvent.keyCode) {
-                    KeyEvent.KEYCODE_MEDIA_NEXT,
-                    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
-                    KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD -> {
-                        skipToNext()
-                        return true
-                    }
-                    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
-                    KeyEvent.KEYCODE_MEDIA_REWIND,
-                    KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD -> {
-                        skipToPrevious()
-                        return true
-                    }
                     KeyEvent.KEYCODE_MEDIA_PLAY -> {
                         player.play()
                         return true
@@ -227,6 +268,9 @@ class PlaybackService : MediaSessionService() {
                         if (player.isPlaying) player.pause() else player.play()
                         return true
                     }
+                    // Requirement 7: Keep one path for next / previous skip.
+                    // Do not handle NEXT/PREVIOUS here; super.onMediaButtonEvent converts them to
+                    // Player commands, which are handled exclusively in onPlayerCommandRequest below.
                 }
             }
             return super.onMediaButtonEvent(mediaSession, controller, intent)

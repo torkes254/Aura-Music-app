@@ -40,7 +40,7 @@ object MediaItemHelper {
     fun toMediaItems(context: android.content.Context, songs: List<Song>): List<MediaItem> {
         val resolver = com.example.data.cover.CoverArtResolver.getInstance(context)
         return songs.map { song ->
-            val artPath = resolver.getArtwork(song)
+            val artPath = resolver.getArtworkCacheOnly(song)
             val artUri = artPath?.let { android.net.Uri.fromFile(java.io.File(it)) }
             toMediaItem(song, artUri)
         }

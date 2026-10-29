@@ -12,6 +12,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -30,6 +32,14 @@ class CoverArtResolver(private val context: Context) {
     private val onlineDir = File(context.filesDir, "online_cover_art").apply { mkdirs() }
     private val legacyDir = File(context.filesDir, "cover_art").apply { mkdirs() }
 
+    private val noEmbeddedArtPrefs = context.getSharedPreferences("aura_music_no_embedded_art", Context.MODE_PRIVATE)
+    private val noEmbeddedArtSongIds = ConcurrentHashMap.newKeySet<Long>().apply {
+        val saved = noEmbeddedArtPrefs.getStringSet("ids", emptySet()) ?: emptySet()
+        for (s in saved) {
+            s.toLongOrNull()?.let { add(it) }
+        }
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -40,6 +50,16 @@ class CoverArtResolver(private val context: Context) {
     val coverArtMap: StateFlow<Map<String, String>> = _coverArtMap.asStateFlow()
 
     private val scope = CoroutineScope(Dispatchers.IO)
+    private var backgroundResolveJob: Job? = null
+
+    private fun markNoEmbeddedArt(songId: Long) {
+        if (noEmbeddedArtSongIds.add(songId)) {
+            scope.launch(Dispatchers.IO) {
+                val set = noEmbeddedArtSongIds.map { it.toString() }.toSet()
+                noEmbeddedArtPrefs.edit().putStringSet("ids", set).apply()
+            }
+        }
+    }
 
     companion object {
         private const val TAG = "CoverArtResolver"
@@ -192,6 +212,50 @@ class CoverArtResolver(private val context: Context) {
         return null
     }
 
+    /**
+     * Fast cache-only lookup for queue building:
+     * Memory cache and already-cached files only: NO MediaMetadataRetriever and NO directory scanning.
+     */
+    fun getArtworkCacheOnly(song: Song): String? {
+        val albumKey = getAlbumKey(song.album, song.artist)
+        val songKey = getSongKey(song.id)
+
+        // 1. In-memory cache check
+        val cached = memoryCache[songKey] ?: memoryCache[albumKey]
+        if (cached != null) {
+            val f = File(cached)
+            if (f.exists() && f.length() > 0) {
+                val picked = getPickedArt(song.id, albumKey)
+                if (picked != null) return picked
+                return cached
+            }
+        }
+
+        // 2. Picked art (direct file existence check without folder listing)
+        val picked = getPickedArt(song.id, albumKey)
+        if (picked != null) {
+            updateMap(songKey, picked)
+            updateMap(albumKey, picked)
+            return picked
+        }
+
+        // 3. Pre-existing cached embedded file
+        val embeddedFile = File(embeddedDir, "song_${song.id}.jpg")
+        if (embeddedFile.exists() && embeddedFile.length() > 0) {
+            updateMap(songKey, embeddedFile.absolutePath)
+            return embeddedFile.absolutePath
+        }
+
+        // 4. Pre-existing cached online file
+        val onlinePath = getCachedOnlineArt(albumKey)
+        if (onlinePath != null) {
+            updateMap(albumKey, onlinePath)
+            return onlinePath
+        }
+
+        return null
+    }
+
     // 1. Picked art lookup
     private fun getPickedArt(songId: Long, albumKey: String): String? {
         val songSpecific = File(pickedDir, "song_${songId}.jpg")
@@ -209,6 +273,10 @@ class CoverArtResolver(private val context: Context) {
 
     // 2. Embedded art extraction & disk caching
     private fun getOrExtractEmbeddedArt(song: Song): String? {
+        if (noEmbeddedArtSongIds.contains(song.id)) {
+            return null
+        }
+
         val cached = File(embeddedDir, "song_${song.id}.jpg")
         if (cached.exists() && cached.length() > 0) {
             return cached.absolutePath
@@ -224,9 +292,12 @@ class CoverArtResolver(private val context: Context) {
                     out.write(pictureBytes)
                 }
                 return cached.absolutePath
+            } else {
+                markNoEmbeddedArt(song.id)
             }
         } catch (e: Exception) {
             // No embedded art in file or unreadable
+            markNoEmbeddedArt(song.id)
         }
 
         return null
@@ -281,15 +352,32 @@ class CoverArtResolver(private val context: Context) {
     }
 
     /**
-     * Resolves and pre-caches artwork for a list of songs asynchronously.
-     * Immediate in-memory and StateFlow updates ensure instant UI rendering.
+     * Resolves artwork for the library in the background on Dispatchers.IO, in small batches,
+     * updating the UI as results arrive.
      */
-    fun precacheArtwork(songs: List<Song>) {
-        scope.launch {
-            for (song in songs) {
-                getArtwork(song)
+    fun resolveLibraryCoversInBackground(songs: List<Song>, batchSize: Int = 10) {
+        backgroundResolveJob?.cancel()
+        backgroundResolveJob = scope.launch(Dispatchers.IO) {
+            val chunks = songs.chunked(batchSize)
+            for (chunk in chunks) {
+                for (song in chunk) {
+                    val songKey = getSongKey(song.id)
+                    val albumKey = getAlbumKey(song.album, song.artist)
+                    if (memoryCache.containsKey(songKey) || memoryCache.containsKey(albumKey)) {
+                        continue
+                    }
+                    getArtwork(song)
+                }
+                delay(50)
             }
         }
+    }
+
+    /**
+     * Resolves and pre-caches artwork for a list of songs asynchronously.
+     */
+    fun precacheArtwork(songs: List<Song>) {
+        resolveLibraryCoversInBackground(songs)
     }
 
     suspend fun resolveCoverForSong(song: Song): String? = withContext(Dispatchers.IO) {

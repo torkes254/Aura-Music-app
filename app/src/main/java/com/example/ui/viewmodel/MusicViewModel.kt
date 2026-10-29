@@ -99,10 +99,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private var isObserverRegistered = false
     private var rescanJob: Job? = null
+    private var scanJob: Job? = null
+    private var mediaStoreChanged = true
 
     private val mediaStoreObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             super.onChange(selfChange, uri)
+            mediaStoreChanged = true
             rescanJob?.cancel()
             rescanJob = viewModelScope.launch {
                 delay(1200)
@@ -172,31 +175,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onAppResume() {
         backgroundVideoManager.updateBatterySaverStatus()
-        if (_uiState.value.hasPermission) {
+        // Skip rescan on resume unless MediaStore actually changed
+        if (_uiState.value.hasPermission && mediaStoreChanged) {
             scanLibrary()
         }
     }
 
     fun scanLibrary() {
-        viewModelScope.launch {
+        // Allow only one scan at a time
+        if (scanJob?.isActive == true) return
+        scanJob = viewModelScope.launch {
             _uiState.update { it.copy(isScanning = true) }
-            val rawSongs = repository.queryAllSongs()
-            processDiscoveredSongs(rawSongs)
-            _uiState.update { it.copy(isScanning = false) }
+            try {
+                val rawSongs = repository.queryAllSongs()
+                processDiscoveredSongs(rawSongs)
+                mediaStoreChanged = false
+            } finally {
+                _uiState.update { it.copy(isScanning = false) }
+            }
         }
     }
 
     fun generateSampleTracks() {
-        viewModelScope.launch {
+        if (scanJob?.isActive == true) return
+        scanJob = viewModelScope.launch {
             _uiState.update { it.copy(isScanning = true) }
-            repository.generateSampleAudioFiles()
-            val rawSongs = repository.queryAllSongs()
-            processDiscoveredSongs(rawSongs)
-            _uiState.update { it.copy(isScanning = false) }
+            try {
+                repository.generateSampleAudioFiles()
+                val rawSongs = repository.queryAllSongs()
+                processDiscoveredSongs(rawSongs)
+                mediaStoreChanged = false
+            } finally {
+                _uiState.update { it.copy(isScanning = false) }
+            }
         }
     }
 
-    private fun processDiscoveredSongs(allSongs: List<Song>) {
+    private suspend fun processDiscoveredSongs(allSongs: List<Song>) = withContext(Dispatchers.Default) {
         val folderCounts = mutableMapOf<String, Int>()
         for (song in allSongs) {
             folderCounts[song.folder] = (folderCounts[song.folder] ?: 0) + 1
@@ -226,28 +241,40 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             )
         }.sortedBy { it.name.lowercase() }
 
-        val updatedPlSongs = _uiState.value.selectedPlaylist?.let {
+        val currentSelectedPl = _uiState.value.selectedPlaylist
+        val updatedPlSongs = currentSelectedPl?.let {
             SmartPlaylistEvaluator.evaluate(it, allSongs, enabledFolders)
         } ?: emptyList()
 
-        _uiState.update {
-            it.copy(
-                songs = filteredSongs,
-                allDiscoveredSongs = allSongs,
-                albums = albums,
-                artists = artists,
-                folders = folderItems,
-                enabledFolders = enabledFolders,
-                selectedPlaylistSongs = updatedPlSongs
+        val previousSongIds = _uiState.value.songs.map { it.id }
+        val newSongIds = filteredSongs.map { it.id }
+        val songListChanged = previousSongIds != newSongIds
+
+        withContext(Dispatchers.Main) {
+            _uiState.update {
+                it.copy(
+                    songs = filteredSongs,
+                    allDiscoveredSongs = allSongs,
+                    albums = albums,
+                    artists = artists,
+                    folders = folderItems,
+                    enabledFolders = enabledFolders,
+                    selectedPlaylistSongs = updatedPlSongs
+                )
+            }
+        }
+
+        // Only update the player queue if the song list actually changed and playback is idle
+        if (songListChanged && !playerState.value.isPlaying) {
+            playerManager.updateLibrary(
+                allSongs = filteredSongs,
+                isCurrentTrackPlaying = false,
+                allKnownSongs = allSongs
             )
         }
 
-        // Keep queue manager updated with current library
-        playerManager.updateLibrary(
-            allSongs = filteredSongs,
-            isCurrentTrackPlaying = playerState.value.isPlaying,
-            allKnownSongs = allSongs
-        )
+        // Resolve artwork in background on Dispatchers.IO in small batches
+        com.example.data.cover.CoverArtResolver.getInstance(getApplication()).resolveLibraryCoversInBackground(filteredSongs)
 
         // Check for any unlinked songs from backups that can now be linked
         val relinkedMap = mutableMapOf<Long, Long>()
@@ -258,7 +285,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             repository.updatePlaylistsWithRelinkedSongs(relinkedMap)
             backgroundVideoManager.updateSongVideosWithRelinkedSongs(relinkedMap)
             PlayCountManager.getInstance(getApplication()).updatePlayCountsWithRelinkedSongs(relinkedMap)
-            setUserMessage("Re-linked $relinkedCount song(s) from backup!")
+            withContext(Dispatchers.Main) {
+                setUserMessage("Re-linked $relinkedCount song(s) from backup!")
+            }
         }
     }
 
